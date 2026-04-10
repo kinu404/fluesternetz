@@ -72,14 +72,14 @@ class FluesternetzPaket:
     Repräsentiert ein FlüsterNetz-Protokollpaket.
 
     Paketformat (Header: 16 Bytes fest):
-    +--------+--------+---------+-------+--------+----------+-----------+----------+
-    | Feld   | Magic  | Version | Typ   | Flags  | Sequenz  | Zeitstempel| Länge   |
-    | Bytes  |   2    |    1    |   1   |   1    |    2     |     4      |    2    |
+    +--------+--------+---------+-------+--------+----------+-----------+---------+
+    | Feld   | Magic  | Version | Typ   | Flags  | Sequenz  | Zeitstempel| Länge  |
+    | Bytes  |   2    |    1    |   1   |   1    |    2     |     4      |    2   |
     | Offset |   0    |    2    |   3   |   4    |    5     |     7      |   11   |
     +--------+--------+---------+-------+--------+----------+-----------+---------+
     | Feld   | Prüfsumme (HMAC-SHA256, 32 Bytes)                                  |
-    | Bytes  |   32                                                                |
-    | Offset |   13                                                                |
+    | Bytes  |   32                                                               |
+    | Offset |   13                                                               |
     +--------+--------+---------+-------+--------+----------+-----------+---------+
     | Feld   | Nutzlast (variable Länge)                                          |
     | Bytes  |   0 - 65535                                                        |
@@ -581,8 +581,8 @@ class FluesternetzChat:
         print(f"╔══════════════════════════════════════════╗")
         print(f"║     FlüsterNetz Chat - Server-Modus      ║")
         print(f"╠══════════════════════════════════════════╣")
-        print(f"║  Benutzername: {self.benutzername:<25s} ║")
-        print(f"║  Port: {port:<32d} ║")
+        print(f"║  Benutzername: {self.benutzername:<25s}  ║")
+        print(f"║  Port: {port:<32d}                       ║")
         print(f"╚══════════════════════════════════════════╝")
         print()
 
@@ -639,8 +639,8 @@ class FluesternetzChat:
         print(f"╔══════════════════════════════════════════╗")
         print(f"║     FlüsterNetz Chat - Client-Modus      ║")
         print(f"╠══════════════════════════════════════════╣")
-        print(f"║  Benutzername: {self.benutzername:<25s} ║")
-        print(f"║  Ziel: {ziel_adresse:<20s}:{port:<10d} ║")
+        print(f"║  Benutzername: {self.benutzername:<25s}  ║")
+        print(f"║  Ziel: {ziel_adresse:<20s}:{port:<10d}   ║")
         print(f"╚══════════════════════════════════════════╝")
         print()
 
