@@ -1,816 +1,642 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FlüsterNetz - Sicheres Peer-to-Peer Chatprotokoll
-===================================================
-Dieses Programm implementiert das FlüsterNetz-Chatprotokoll,
-ein sicheres P2P-Kommunikationsprotokoll für verschlüsselte Nachrichten.
+FlüsterNetz - P2P Chatprotokoll mit TLS-Verschlüsselung
+Programmentwurf Network Security 2026 - DHBW
 
-Autoren: [Namen hier eintragen]
-Version: 1.0
+Autoren: Philipp Reich, Celil Sahin, Glenn Strommer,
+         Lukas Gagstatter, Noah Vesenjak-Dolinsek
 """
 
-import socket       # Netzwerkverbindungen über TCP-Sockets
-import ssl          # TLS/SSL-Verschlüsselung der Transportschicht
-import threading    # Nebenläufige Verarbeitung für Senden/Empfangen
-import struct       # Binäres Packen/Entpacken von Protokollfeldern
-import hashlib      # SHA-256 Prüfsummenberechnung für Integrität
-import hmac         # HMAC-basierte Nachrichtenauthentifizierung
-import os           # Betriebssystemfunktionen (Zufallszahlen)
-import sys          # Systemfunktionen (Kommandozeilenargumente)
-import time         # Zeitstempel für Nachrichten
-import json         # JSON-Serialisierung für Handshake-Daten
-import argparse     # Kommandozeilenargument-Verarbeitung
-import secrets      # Kryptographisch sichere Zufallszahlen
-import signal       # Signalbehandlung für sauberes Beenden
+# region Imports
+import socket
+import ssl
+import threading
+import struct
+import hmac
+import hashlib
+import os
+import time
+import json
+import argparse
+import secrets
+# endregion
 
-# ============================================================
-# Protokollkonstanten
-# ============================================================
 
-PROTOKOLL_VERSION = 1          # Aktuelle Protokollversion
-PROTOKOLL_PORT = 9777          # Standardport für FlüsterNetz
-MAGISCHE_BYTES = b'\xF1\xCE'  # Magische Bytes zur Paketerkennung ("FlüsterNetz Cipher Envelope")
-MAX_NUTZLAST = 65535           # Maximale Nutzlastgröße in Bytes
+# region Konstanten und Nachrichtentypen
 
-# Nachrichtentypen als ganzzahlige Konstanten
+PROTOKOLL_VERSION = 1
+PROTOKOLL_PORT = 9777	# bei IANA nicht registriert, kein Konflikt bekannt
+MAGISCHE_BYTES = b'\xF1\xCE'	# "FlüsterNetz Cipher Envelope"
+MAX_NUTZLAST = 65535	# 2 Byte Längenfeld -> max 64 KiB
+
+
 class NachrichtenTyp:
-    """Definiert die verschiedenen Nachrichtentypen im FlüsterNetz-Protokoll."""
-    HALLO = 0x01           # Verbindungsaufbau: Hallo-Nachricht
-    HALLO_ANTWORT = 0x02   # Verbindungsaufbau: Antwort auf Hallo
-    SCHLUESSEL = 0x03      # Schlüsselaustausch-Nachricht
-    CHAT = 0x10            # Chat-Textnachricht
-    BESTAETIGUNG = 0x11    # Empfangsbestätigung (ACK)
-    HERZSCHLAG = 0x20      # Herzschlag / Keep-Alive
-    TSCHUESS = 0xF0        # Verbindungsabbau: Abschiedsnachricht
-    FEHLER = 0xFF          # Fehlernachricht
+	"""Nachrichtentypen im FlüsterNetz-Protokoll (vgl. Whitepaper Abschnitt 4.1)"""
+	HALLO = 0x01	# Verbindungsaufbau
+	HALLO_ANTWORT = 0x02
+	SCHLUESSEL = 0x03	# reserviert für spätere Erweiterung
+	CHAT = 0x10
+	BESTAETIGUNG = 0x11	# ACK
+	HERZSCHLAG = 0x20	# Keep-Alive
+	TSCHUESS = 0xF0	# Verbindungsabbau
+	FEHLER = 0xFF
 
-    # Zuordnung von Typ-Nummern zu lesbaren Namen
-    NAMEN = {
-        0x01: "HALLO",
-        0x02: "HALLO_ANTWORT",
-        0x03: "SCHLUESSEL",
-        0x10: "CHAT",
-        0x11: "BESTAETIGUNG",
-        0x20: "HERZSCHLAG",
-        0xF0: "TSCHUESS",
-        0xFF: "FEHLER",
-    }
+	NAMEN = {
+		0x01: "HALLO",
+		0x02: "HALLO_ANTWORT",
+		0x03: "SCHLUESSEL",
+		0x10: "CHAT",
+		0x11: "BESTAETIGUNG",
+		0x20: "HERZSCHLAG",
+		0xF0: "TSCHUESS",
+		0xFF: "FEHLER",
+	}
 
-    @staticmethod
-    def name_von(typ):
-        """Gibt den lesbaren Namen eines Nachrichtentyps zurück."""
-        return NachrichtenTyp.NAMEN.get(typ, f"UNBEKANNT(0x{typ:02X})")
+	@staticmethod
+	def name_von(typ):
+		return NachrichtenTyp.NAMEN.get(typ, f"UNBEKANNT(0x{typ:02X})")
+
+# endregion
 
 
-# ============================================================
-# Protokollpaket-Klasse
-# ============================================================
+# region Paket-Klasse
 
 class FluesternetzPaket:
-    """
-    Repräsentiert ein FlüsterNetz-Protokollpaket.
+	"""
+	Ein FlüsterNetz-Protokollpaket.
 
-    Paketformat (Header: 16 Bytes fest):
-    +--------+--------+---------+-------+--------+----------+-----------+---------+
-    | Feld   | Magic  | Version | Typ   | Flags  | Sequenz  | Zeitstempel| Länge  |
-    | Bytes  |   2    |    1    |   1   |   1    |    2     |     4      |    2   |
-    | Offset |   0    |    2    |   3   |   4    |    5     |     7      |   11   |
-    +--------+--------+---------+-------+--------+----------+-----------+---------+
-    | Feld   | Prüfsumme (HMAC-SHA256, 32 Bytes)                                  |
-    | Bytes  |   32                                                               |
-    | Offset |   13                                                               |
-    +--------+--------+---------+-------+--------+----------+-----------+---------+
-    | Feld   | Nutzlast (variable Länge)                                          |
-    | Bytes  |   0 - 65535                                                        |
-    | Offset |   45                                                               |
-    +--------+--------+---------+-------+--------+----------+-----------+---------+
+	Header: Magic(2) | Version(1) | Typ(1) | Flags(1) | Seq(2) | Zeit(4) | Länge(2) | HMAC(32)
+	Danach folgt die variable Nutzlast (0 bis 65535 Bytes).
+	Gesamt-Header: 13 + 32 = 45 Bytes
+	"""
 
-    Gesamter Header: 13 Bytes + 32 Bytes HMAC = 45 Bytes
-    """
+	HEADER_FORMAT = '!2sBBBHIH'	# Network Byte Order
+	HEADER_LAENGE = struct.calcsize(HEADER_FORMAT)	# 13 Bytes
+	HMAC_LAENGE = 32
+	GESAMT_HEADER = HEADER_LAENGE + HMAC_LAENGE	# 45 Bytes
 
-    # Format des Headers: ! = Network Byte Order (Big-Endian)
-    # 2s = Magic (2 Bytes), B = Version (1 Byte), B = Typ (1 Byte),
-    # B = Flags (1 Byte), H = Sequenznummer (2 Bytes),
-    # I = Zeitstempel (4 Bytes), H = Nutzlastlänge (2 Bytes)
-    HEADER_FORMAT = '!2sBBBHIH'
-    HEADER_LAENGE = struct.calcsize(HEADER_FORMAT)  # 13 Bytes
-    HMAC_LAENGE = 32  # SHA-256 HMAC-Länge in Bytes
-    GESAMT_HEADER = HEADER_LAENGE + HMAC_LAENGE     # 45 Bytes
+	def __init__(self, typ, nutzlast=b'', sequenz=0, flags=0):
+		self.magic = MAGISCHE_BYTES
+		self.version = PROTOKOLL_VERSION
+		self.typ = typ
+		self.flags = flags
+		self.sequenz = sequenz
+		self.zeitstempel = int(time.time())
+		self.nutzlast = nutzlast
+		self.hmac_wert = b'\x00' * self.HMAC_LAENGE
 
-    def __init__(self, typ, nutzlast=b'', sequenz=0, flags=0):
-        """
-        Erstellt ein neues FlüsterNetz-Paket.
+	def packen(self, hmac_schluessel=None):
+		"""Paket in Bytes serialisieren. Berechnet HMAC falls Schlüssel vorhanden."""
+		if len(self.nutzlast) > MAX_NUTZLAST:
+			raise ValueError(f"Nutzlast zu groß: {len(self.nutzlast)} Bytes")
 
-        Parameter:
-            typ: Nachrichtentyp (siehe NachrichtenTyp-Klasse)
-            nutzlast: Die zu sendenden Daten als Bytes
-            sequenz: Sequenznummer zur Nachrichtenverfolgung
-            flags: Zusätzliche Flags (Bit 0: Verschlüsselt, Bit 1: Komprimiert)
-        """
-        self.magic = MAGISCHE_BYTES          # Magische Bytes zur Paketerkennung
-        self.version = PROTOKOLL_VERSION     # Protokollversion
-        self.typ = typ                       # Nachrichtentyp
-        self.flags = flags                   # Flags-Feld
-        self.sequenz = sequenz               # Sequenznummer
-        self.zeitstempel = int(time.time())  # Aktueller Unix-Zeitstempel
-        self.nutzlast = nutzlast             # Nutzdaten
-        self.hmac_wert = b'\x00' * self.HMAC_LAENGE  # Platzhalter für HMAC
+		header = struct.pack(
+			self.HEADER_FORMAT,
+			self.magic, self.version, self.typ,
+			self.flags, self.sequenz,
+			self.zeitstempel, len(self.nutzlast)
+		)
 
-    def packen(self, hmac_schluessel=None):
-        """
-        Serialisiert das Paket in ein Byte-Array zur Übertragung.
+		# HMAC über Header + Nutzlast
+		if hmac_schluessel:
+			self.hmac_wert = hmac.new(
+				hmac_schluessel, header + self.nutzlast, hashlib.sha256
+			).digest()
+		else:
+			self.hmac_wert = b'\x00' * self.HMAC_LAENGE
 
-        Parameter:
-            hmac_schluessel: Geheimer Schlüssel für HMAC-Berechnung (optional)
+		return header + self.hmac_wert + self.nutzlast
 
-        Rückgabe:
-            Byte-Array mit dem vollständigen Paket
-        """
-        # Nutzlastlänge berechnen und begrenzen
-        nutzlast_laenge = len(self.nutzlast)
-        if nutzlast_laenge > MAX_NUTZLAST:
-            raise ValueError(f"Nutzlast zu groß: {nutzlast_laenge} > {MAX_NUTZLAST}")
+	@classmethod
+	def entpacken(cls, daten, hmac_schluessel=None):
+		"""Bytes deserialisieren und HMAC prüfen. Gibt None bei Fehler."""
+		# erstmal schauen ob genug Daten da sind
+		if len(daten) < cls.GESAMT_HEADER:
+			print(f"[FEHLER] Paket zu kurz: {len(daten)} Bytes")
+			return None
 
-        # Header zusammenbauen
-        header = struct.pack(
-            self.HEADER_FORMAT,
-            self.magic,
-            self.version,
-            self.typ,
-            self.flags,
-            self.sequenz,
-            self.zeitstempel,
-            nutzlast_laenge
-        )
+		header_roh = daten[:cls.HEADER_LAENGE]
+		magic, version, typ, flags, sequenz, zeit, laenge = struct.unpack(
+			cls.HEADER_FORMAT, header_roh
+		)
 
-        # HMAC berechnen, wenn Schlüssel vorhanden
-        if hmac_schluessel:
-            # HMAC über Header + Nutzlast berechnen
-            zu_signieren = header + self.nutzlast
-            self.hmac_wert = hmac.new(
-                hmac_schluessel, zu_signieren, hashlib.sha256
-            ).digest()
-        else:
-            self.hmac_wert = b'\x00' * self.HMAC_LAENGE
+		# Magic Bytes prüfen. Wenn die nicht stimmen ist es kein FlüsterNetz-Paket
+		if magic != MAGISCHE_BYTES:
+			print(f"[FEHLER] Falsche Magic Bytes: 0x{magic.hex()}")
+			return None
 
-        # Gesamtpaket: Header + HMAC + Nutzlast
-        return header + self.hmac_wert + self.nutzlast
+		if version != PROTOKOLL_VERSION:
+			print(f"[WARNUNG] Unbekannte Protokollversion: {version}")
 
-    @classmethod
-    def entpacken(cls, daten, hmac_schluessel=None):
-        """
-        Deserialisiert ein Byte-Array in ein FlüsterNetz-Paket.
+		hmac_empfangen = daten[cls.HEADER_LAENGE:cls.GESAMT_HEADER]
+		nutzlast = daten[cls.GESAMT_HEADER:cls.GESAMT_HEADER + laenge]
 
-        Parameter:
-            daten: Empfangene Rohdaten als Bytes
-            hmac_schluessel: Geheimer Schlüssel zur HMAC-Überprüfung (optional)
+		# defensive Prüfung "haben wir wirklich so viele Bytes wie im Header angegeben"?
+		if len(nutzlast) < laenge:
+			print(f"[FEHLER] Nutzlast unvollständig: erwartet {laenge}, bekommen {len(nutzlast)}")
+			return None
 
-        Rückgabe:
-            Ein FluesternetzPaket-Objekt oder None bei Fehler
-        """
-        # Mindestlänge prüfen
-        if len(daten) < cls.GESAMT_HEADER:
-            print(f"[FEHLER] Paket zu kurz: {len(daten)} < {cls.GESAMT_HEADER} Bytes")
-            return None
+		# HMAC verifizieren
+		if hmac_schluessel:
+			hmac_erwartet = hmac.new(
+				hmac_schluessel, header_roh + nutzlast, hashlib.sha256
+			).digest()
+			if not hmac.compare_digest(hmac_empfangen, hmac_erwartet):
+				print("[FEHLER] HMAC ungültig - Paket möglicherweise manipuliert!")
+				return None
 
-        # Header entpacken
-        header_daten = daten[:cls.HEADER_LAENGE]
-        magic, version, typ, flags, sequenz, zeitstempel, nutzlast_laenge = struct.unpack(
-            cls.HEADER_FORMAT, header_daten
-        )
+		paket = cls(typ=typ, nutzlast=nutzlast, sequenz=sequenz, flags=flags)
+		paket.version = version
+		paket.zeitstempel = zeit
+		paket.hmac_wert = hmac_empfangen
+		return paket
 
-        # Magische Bytes prüfen
-        if magic != MAGISCHE_BYTES:
-            print(f"[FEHLER] Ungültige magische Bytes: {magic.hex()}")
-            return None
+	def __str__(self):
+		typ_name = NachrichtenTyp.name_von(self.typ)
+		return (f"[FlüsterNetz v{self.version}] {typ_name} "
+			f"Seq={self.sequenz} Flags=0x{self.flags:02X} "
+			f"Nutzlast={len(self.nutzlast)}B")
 
-        # Version prüfen
-        if version != PROTOKOLL_VERSION:
-            print(f"[WARNUNG] Unbekannte Protokollversion: {version}")
-
-        # HMAC extrahieren
-        hmac_empfangen = daten[cls.HEADER_LAENGE:cls.GESAMT_HEADER]
-
-        # Nutzlast extrahieren
-        nutzlast = daten[cls.GESAMT_HEADER:cls.GESAMT_HEADER + nutzlast_laenge]
-
-        # HMAC verifizieren, wenn Schlüssel vorhanden
-        if hmac_schluessel:
-            zu_verifizieren = header_daten + nutzlast
-            hmac_erwartet = hmac.new(
-                hmac_schluessel, zu_verifizieren, hashlib.sha256
-            ).digest()
-            if not hmac.compare_digest(hmac_empfangen, hmac_erwartet):
-                print("[FEHLER] HMAC-Überprüfung fehlgeschlagen! Nachricht manipuliert?")
-                return None
-
-        # Paket-Objekt erstellen
-        paket = cls(typ=typ, nutzlast=nutzlast, sequenz=sequenz, flags=flags)
-        paket.magic = magic
-        paket.version = version
-        paket.zeitstempel = zeitstempel
-        paket.hmac_wert = hmac_empfangen
-        return paket
-
-    def __str__(self):
-        """Gibt eine lesbare Darstellung des Pakets zurück."""
-        typ_name = NachrichtenTyp.name_von(self.typ)
-        return (
-            f"[FlüsterNetz v{self.version}] Typ={typ_name} "
-            f"Seq={self.sequenz} Flags=0x{self.flags:02X} "
-            f"Nutzlast={len(self.nutzlast)} Bytes"
-        )
+# endregion
 
 
-# ============================================================
-# FlüsterNetz Chat-Klasse
-# ============================================================
+# region Chat-Klasse
 
 class FluesternetzChat:
-    """
-    Hauptklasse für den FlüsterNetz P2P-Chat.
-    Verwaltet Verbindungsaufbau, Nachrichtenaustausch und -abbau.
-    """
-
-    def __init__(self, benutzername="Anonym"):
-        """
-        Initialisiert eine neue Chat-Instanz.
-
-        Parameter:
-            benutzername: Der Anzeigename des Benutzers
-        """
-        self.benutzername = benutzername     # Anzeigename im Chat
-        self.verbunden = False               # Verbindungsstatus
-        self.socket = None                   # Netzwerk-Socket
-        self.tls_socket = None               # TLS-verschlüsselter Socket
-        self.sequenz_zaehler = 0             # Laufende Sequenznummer
-        self.hmac_schluessel = None          # Gemeinsamer HMAC-Schlüssel
-        self.empfangs_thread = None          # Thread zum Nachrichtenempfang
-        self.partner_name = ""               # Name des Chat-Partners
-        self.beenden_ereignis = threading.Event()  # Signal zum Beenden
-
-    def _naechste_sequenz(self):
-        """Gibt die nächste Sequenznummer zurück und erhöht den Zähler."""
-        self.sequenz_zaehler += 1
-        return self.sequenz_zaehler % 65536  # Auf 16-Bit begrenzen
-
-    def _tls_kontext_erstellen(self, ist_server=False):
-        """
-        Erstellt einen TLS-Kontext für sichere Kommunikation.
-
-        Parameter:
-            ist_server: True für Serverseite, False für Clientseite
-
-        Rückgabe:
-            Ein konfiguriertes ssl.SSLContext-Objekt
-        """
-        if ist_server:
-            # Server-seitiger TLS-Kontext
-            kontext = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        else:
-            # Client-seitiger TLS-Kontext
-            kontext = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            # Für P2P: Zertifikatsprüfung deaktivieren (selbstsignierte Zertifikate)
-            kontext.check_hostname = False
-            kontext.verify_mode = ssl.CERT_NONE
-
-        # Sichere Protokollversionen erzwingen
-        kontext.minimum_version = ssl.TLSVersion.TLSv1_2
-        return kontext
-
-    def _zertifikate_erstellen(self):
-        """
-        Erstellt selbstsignierte TLS-Zertifikate für den Server.
-        Speichert Zertifikat und Schlüssel als temporäre Dateien.
-
-        Rückgabe:
-            Tuple (zertifikat_pfad, schluessel_pfad)
-        """
-        from cryptography import x509                              # X.509-Zertifikatserstellung
-        from cryptography.x509.oid import NameOID                  # OIDs für Zertifikatsfelder
-        from cryptography.hazmat.primitives import hashes           # Hash-Algorithmen
-        from cryptography.hazmat.primitives import serialization    # Schlüsselserialisierung
-        from cryptography.hazmat.primitives.asymmetric import rsa   # RSA-Schlüsselgenerierung
-        import datetime  # Zeitangaben für Gültigkeit
-
-        # RSA-Schlüsselpaar generieren (2048 Bit)
-        schluessel = rsa.generate_private_key(
-            public_exponent=65537,   # Standard öffentlicher Exponent
-            key_size=2048,           # Schlüssellänge in Bit
-        )
-
-        # Zertifikatsdaten definieren
-        subjekt = aussteller = x509.Name([
-            x509.NameAttribute(NameOID.COMMON_NAME, u"FlüsterNetz P2P Chat"),
-            x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"FlüsterNetz"),
-        ])
-
-        # Selbstsigniertes Zertifikat erstellen
-        zertifikat = (
-            x509.CertificateBuilder()
-            .subject_name(subjekt)
-            .issuer_name(aussteller)
-            .public_key(schluessel.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.datetime.utcnow())
-            .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365))
-            .sign(schluessel, hashes.SHA256())
-        )
-
-        # Schlüssel und Zertifikat in temporäre Dateien schreiben
-        schluessel_pfad = "/tmp/fluesternetz_schluessel.pem"
-        zertifikat_pfad = "/tmp/fluesternetz_zertifikat.pem"
-
-        # Privaten Schlüssel speichern
-        with open(schluessel_pfad, "wb") as f:
-            f.write(schluessel.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.TraditionalOpenSSL,
-                encryption_algorithm=serialization.NoEncryption()
-            ))
-
-        # Zertifikat speichern
-        with open(zertifikat_pfad, "wb") as f:
-            f.write(zertifikat.public_bytes(serialization.Encoding.PEM))
-
-        print("[INFO] Selbstsignierte TLS-Zertifikate erstellt.")
-        return zertifikat_pfad, schluessel_pfad
-
-    def _senden(self, paket):
-        """
-        Sendet ein FlüsterNetz-Paket über den TLS-Socket.
-
-        Parameter:
-            paket: Das zu sendende FluesternetzPaket-Objekt
-        """
-        try:
-            # Paket serialisieren mit HMAC-Schlüssel
-            daten = paket.packen(self.hmac_schluessel)
-            # Länge als 4-Byte-Prefix senden (Framing)
-            laengen_prefix = struct.pack('!I', len(daten))
-            ziel_socket = self.tls_socket if self.tls_socket else self.socket
-            ziel_socket.sendall(laengen_prefix + daten)
-        except (BrokenPipeError, ConnectionResetError, OSError) as e:
-            print(f"\n[FEHLER] Senden fehlgeschlagen: {e}")
-            self.verbunden = False
-
-    def _empfangen(self, sock):
-        """
-        Empfängt ein vollständiges FlüsterNetz-Paket vom Socket.
-
-        Parameter:
-            sock: Der Socket, von dem gelesen wird
-
-        Rückgabe:
-            Ein FluesternetzPaket-Objekt oder None bei Fehler
-        """
-        try:
-            # Zuerst die Paketlänge lesen (4 Bytes)
-            laengen_daten = self._alles_lesen(sock, 4)
-            if not laengen_daten:
-                return None
-            paket_laenge = struct.unpack('!I', laengen_daten)[0]
-
-            # Dann die eigentlichen Paketdaten lesen
-            paket_daten = self._alles_lesen(sock, paket_laenge)
-            if not paket_daten:
-                return None
-
-            # Paket deserialisieren und HMAC prüfen
-            return FluesternetzPaket.entpacken(paket_daten, self.hmac_schluessel)
-
-        except (ConnectionResetError, OSError) as e:
-            return None
-
-    def _alles_lesen(self, sock, anzahl):
-        """
-        Liest exakt die angegebene Anzahl an Bytes vom Socket.
-
-        Parameter:
-            sock: Der Socket, von dem gelesen wird
-            anzahl: Die zu lesende Byteanzahl
-
-        Rückgabe:
-            Die gelesenen Bytes oder None bei Fehler
-        """
-        daten = b''
-        while len(daten) < anzahl:
-            try:
-                stueck = sock.recv(anzahl - len(daten))
-                if not stueck:
-                    return None
-                daten += stueck
-            except (ConnectionResetError, OSError):
-                return None
-        return daten
-
-    def _handshake_ausfuehren(self, ist_server, sock):
-        """
-        Führt den FlüsterNetz-Handshake durch.
-        Tauscht Benutzernamen und vereinbart einen gemeinsamen HMAC-Schlüssel.
-
-        Parameter:
-            ist_server: True wenn dieser Knoten der Server ist
-            sock: Der zu verwendende Socket
-        """
-        if ist_server:
-            # === Server-Seite: Auf HALLO warten ===
-            print("[INFO] Warte auf Handshake vom Client...")
-
-            # HALLO-Paket empfangen
-            paket = self._empfangen(sock)
-            if not paket or paket.typ != NachrichtenTyp.HALLO:
-                raise ConnectionError("Ungültiges HALLO-Paket empfangen")
-
-            # Client-Daten auslesen
-            client_daten = json.loads(paket.nutzlast.decode('utf-8'))
-            self.partner_name = client_daten.get('benutzername', 'Unbekannt')
-            print(f"[INFO] Verbindungsanfrage von: {self.partner_name}")
-
-            # Gemeinsamen HMAC-Schlüssel generieren
-            self.hmac_schluessel = secrets.token_bytes(32)
-
-            # HALLO_ANTWORT senden mit Schlüssel und eigenem Namen
-            antwort_daten = json.dumps({
-                'benutzername': self.benutzername,
-                'hmac_schluessel': self.hmac_schluessel.hex(),
-                'status': 'akzeptiert'
-            }).encode('utf-8')
-
-            antwort = FluesternetzPaket(
-                typ=NachrichtenTyp.HALLO_ANTWORT,
-                nutzlast=antwort_daten,
-                sequenz=self._naechste_sequenz()
-            )
-            self._tls_senden(sock, antwort)
-
-        else:
-            # === Client-Seite: HALLO senden ===
-            hallo_daten = json.dumps({
-                'benutzername': self.benutzername,
-                'version': PROTOKOLL_VERSION,
-            }).encode('utf-8')
-
-            hallo = FluesternetzPaket(
-                typ=NachrichtenTyp.HALLO,
-                nutzlast=hallo_daten,
-                sequenz=self._naechste_sequenz()
-            )
-            self._tls_senden(sock, hallo)
-
-            # Auf HALLO_ANTWORT warten
-            paket = self._empfangen(sock)
-            if not paket or paket.typ != NachrichtenTyp.HALLO_ANTWORT:
-                raise ConnectionError("Ungültige HALLO_ANTWORT empfangen")
-
-            # Server-Daten auslesen
-            server_daten = json.loads(paket.nutzlast.decode('utf-8'))
-            self.partner_name = server_daten.get('benutzername', 'Unbekannt')
-            self.hmac_schluessel = bytes.fromhex(server_daten['hmac_schluessel'])
-
-            if server_daten.get('status') != 'akzeptiert':
-                raise ConnectionError("Verbindung vom Server abgelehnt")
-
-        print(f"[INFO] Handshake erfolgreich mit: {self.partner_name}")
-        self.verbunden = True
-
-    def _tls_senden(self, sock, paket):
-        """
-        Sendet ein Paket über den angegebenen Socket (für Handshake-Phase).
-
-        Parameter:
-            sock: Der Socket zum Senden
-            paket: Das zu sendende Paket
-        """
-        daten = paket.packen(self.hmac_schluessel)
-        laengen_prefix = struct.pack('!I', len(daten))
-        sock.sendall(laengen_prefix + daten)
-
-    def _empfangs_schleife(self):
-        """
-        Hauptschleife zum Empfangen von Nachrichten.
-        Läuft in einem eigenen Thread.
-        """
-        ziel_socket = self.tls_socket if self.tls_socket else self.socket
-        while self.verbunden and not self.beenden_ereignis.is_set():
-            paket = self._empfangen(ziel_socket)
-            if paket is None:
-                if self.verbunden:
-                    print(f"\n[INFO] Verbindung zu {self.partner_name} verloren.")
-                    self.verbunden = False
-                break
-
-            # Paket je nach Typ verarbeiten
-            self._paket_verarbeiten(paket)
-
-    def _paket_verarbeiten(self, paket):
-        """
-        Verarbeitet ein empfangenes Paket je nach Nachrichtentyp.
-
-        Parameter:
-            paket: Das empfangene FluesternetzPaket-Objekt
-        """
-        if paket.typ == NachrichtenTyp.CHAT:
-            # Chat-Nachricht anzeigen
-            nachricht = paket.nutzlast.decode('utf-8')
-            zeitstempel = time.strftime('%H:%M:%S', time.localtime(paket.zeitstempel))
-            print(f"\n[{zeitstempel}] {self.partner_name}: {nachricht}")
-            print(f"Du ({self.benutzername}): ", end='', flush=True)
-
-            # Empfangsbestätigung senden
-            bestaetigung = FluesternetzPaket(
-                typ=NachrichtenTyp.BESTAETIGUNG,
-                nutzlast=struct.pack('!H', paket.sequenz),
-                sequenz=self._naechste_sequenz()
-            )
-            self._senden(bestaetigung)
-
-        elif paket.typ == NachrichtenTyp.BESTAETIGUNG:
-            # Empfangsbestätigung verarbeiten (still)
-            pass
-
-        elif paket.typ == NachrichtenTyp.HERZSCHLAG:
-            # Herzschlag-Antwort senden
-            antwort = FluesternetzPaket(
-                typ=NachrichtenTyp.HERZSCHLAG,
-                sequenz=self._naechste_sequenz()
-            )
-            self._senden(antwort)
-
-        elif paket.typ == NachrichtenTyp.TSCHUESS:
-            # Verbindungsabbau vom Partner
-            print(f"\n[INFO] {self.partner_name} hat den Chat verlassen.")
-            self.verbunden = False
-
-        elif paket.typ == NachrichtenTyp.FEHLER:
-            # Fehlermeldung anzeigen
-            fehlermeldung = paket.nutzlast.decode('utf-8')
-            print(f"\n[FEHLER vom Partner] {fehlermeldung}")
-
-        else:
-            print(f"\n[WARNUNG] Unbekannter Nachrichtentyp: {NachrichtenTyp.name_von(paket.typ)}")
-
-    def nachricht_senden(self, text):
-        """
-        Sendet eine Chat-Nachricht an den Partner.
-
-        Parameter:
-            text: Der zu sendende Nachrichtentext
-        """
-        if not self.verbunden:
-            print("[FEHLER] Keine Verbindung vorhanden.")
-            return
-
-        # Chat-Paket erstellen
-        paket = FluesternetzPaket(
-            typ=NachrichtenTyp.CHAT,
-            nutzlast=text.encode('utf-8'),
-            sequenz=self._naechste_sequenz(),
-            flags=0x01  # Flag: Nachricht wird über TLS-verschlüsselten Kanal gesendet
-        )
-        self._senden(paket)
-
-    def als_server_starten(self, port=PROTOKOLL_PORT):
-        """
-        Startet den Chat im Server-Modus (wartet auf eingehende Verbindung).
-
-        Parameter:
-            port: Der Port, auf dem gehört werden soll
-        """
-        print(f"╔══════════════════════════════════════════╗")
-        print(f"║     FlüsterNetz Chat - Server-Modus      ║")
-        print(f"╠══════════════════════════════════════════╣")
-        print(f"║  Benutzername: {self.benutzername:<25s}  ║")
-        print(f"║  Port: {port:<32d}                       ║")
-        print(f"╚══════════════════════════════════════════╝")
-        print()
-
-        # TLS-Zertifikate erstellen
-        zertifikat_pfad, schluessel_pfad = self._zertifikate_erstellen()
-
-        # Server-Socket erstellen und konfigurieren
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind(('0.0.0.0', port))
-        server_socket.listen(1)  # Maximal eine eingehende Verbindung (P2P)
-
-        print(f"[INFO] Warte auf Verbindung auf Port {port}...")
-
-        try:
-            # Auf Client-Verbindung warten
-            client_socket, adresse = server_socket.accept()
-            print(f"[INFO] Verbindung von {adresse[0]}:{adresse[1]}")
-
-            # TLS-Kontext konfigurieren und Socket umwickeln
-            tls_kontext = self._tls_kontext_erstellen(ist_server=True)
-            tls_kontext.load_cert_chain(zertifikat_pfad, schluessel_pfad)
-            self.tls_socket = tls_kontext.wrap_socket(client_socket, server_side=True)
-            self.socket = client_socket
-
-            print(f"[INFO] TLS-Verbindung hergestellt: {self.tls_socket.version()}")
-
-            # Handshake durchführen
-            self._handshake_ausfuehren(ist_server=True, sock=self.tls_socket)
-
-            # Chat-Schleife starten
-            self._chat_schleife()
-
-        except KeyboardInterrupt:
-            print("\n[INFO] Server wird beendet...")
-        except Exception as e:
-            print(f"[FEHLER] {e}")
-        finally:
-            self._aufraeumen()
-            server_socket.close()
-            # Zertifikate aufräumen
-            for pfad in [zertifikat_pfad, schluessel_pfad]:
-                if os.path.exists(pfad):
-                    os.remove(pfad)
-
-    def als_client_verbinden(self, ziel_adresse, port=PROTOKOLL_PORT):
-        """
-        Verbindet sich als Client mit einem FlüsterNetz-Server.
-
-        Parameter:
-            ziel_adresse: IP-Adresse oder Hostname des Servers
-            port: Port des Servers
-        """
-        print(f"╔══════════════════════════════════════════╗")
-        print(f"║     FlüsterNetz Chat - Client-Modus      ║")
-        print(f"╠══════════════════════════════════════════╣")
-        print(f"║  Benutzername: {self.benutzername:<25s}  ║")
-        print(f"║  Ziel: {ziel_adresse:<20s}:{port:<10d}   ║")
-        print(f"╚══════════════════════════════════════════╝")
-        print()
-
-        try:
-            # TCP-Verbindung herstellen
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.connect((ziel_adresse, port))
-            print(f"[INFO] TCP-Verbindung zu {ziel_adresse}:{port} hergestellt.")
-
-            # TLS-Kontext konfigurieren und Socket umwickeln
-            tls_kontext = self._tls_kontext_erstellen(ist_server=False)
-            self.tls_socket = tls_kontext.wrap_socket(
-                self.socket, server_hostname=ziel_adresse
-            )
-            print(f"[INFO] TLS-Verbindung hergestellt: {self.tls_socket.version()}")
-
-            # Handshake durchführen
-            self._handshake_ausfuehren(ist_server=False, sock=self.tls_socket)
-
-            # Chat-Schleife starten
-            self._chat_schleife()
-
-        except ConnectionRefusedError:
-            print(f"[FEHLER] Verbindung zu {ziel_adresse}:{port} abgelehnt.")
-        except KeyboardInterrupt:
-            print("\n[INFO] Verbindung wird beendet...")
-        except Exception as e:
-            print(f"[FEHLER] {e}")
-        finally:
-            self._aufraeumen()
-
-    def _chat_schleife(self):
-        """
-        Hauptschleife für den Chat-Betrieb.
-        Startet den Empfangs-Thread und verarbeitet Benutzereingaben.
-        """
-        print()
-        print(f"════════════════════════════════════════════")
-        print(f"  Chat mit {self.partner_name} gestartet!")
-        print(f"  Zum Beenden '/quit' eingeben.")
-        print(f"════════════════════════════════════════════")
-        print()
-
-        # Empfangs-Thread starten
-        self.empfangs_thread = threading.Thread(
-            target=self._empfangs_schleife,
-            daemon=True,   # Thread wird beim Programmende automatisch beendet
-            name="Empfangs-Thread"
-        )
-        self.empfangs_thread.start()
-
-        # Eingabeschleife
-        try:
-            while self.verbunden:
-                eingabe = input(f"Du ({self.benutzername}): ")
-
-                # Leere Eingaben ignorieren
-                if not eingabe.strip():
-                    continue
-
-                # Befehle verarbeiten
-                if eingabe.strip().lower() == '/quit':
-                    print("[INFO] Chat wird beendet...")
-                    self._verbindung_beenden()
-                    break
-                elif eingabe.strip().lower() == '/info':
-                    self._info_anzeigen()
-                    continue
-
-                # Nachricht senden
-                self.nachricht_senden(eingabe)
-
-        except (KeyboardInterrupt, EOFError):
-            print("\n[INFO] Chat wird beendet...")
-            self._verbindung_beenden()
-
-    def _verbindung_beenden(self):
-        """Sendet eine Abschiedsnachricht und beendet die Verbindung ordnungsgemäß."""
-        if self.verbunden:
-            tschuess = FluesternetzPaket(
-                typ=NachrichtenTyp.TSCHUESS,
-                nutzlast=f"{self.benutzername} hat den Chat verlassen.".encode('utf-8'),
-                sequenz=self._naechste_sequenz()
-            )
-            self._senden(tschuess)
-            self.verbunden = False
-
-    def _info_anzeigen(self):
-        """Zeigt Informationen über die aktuelle Verbindung an."""
-        print(f"\n--- Verbindungsinformationen ---")
-        print(f"  Protokoll: FlüsterNetz v{PROTOKOLL_VERSION}")
-        print(f"  Partner: {self.partner_name}")
-        print(f"  TLS-Version: {self.tls_socket.version() if self.tls_socket else 'Keine'}")
-        print(f"  HMAC-Schlüssel: {'Aktiv' if self.hmac_schluessel else 'Nicht gesetzt'}")
-        print(f"  Sequenzzähler: {self.sequenz_zaehler}")
-        print(f"-------------------------------\n")
-
-    def _aufraeumen(self):
-        """Schließt alle offenen Verbindungen und räumt Ressourcen auf."""
-        self.verbunden = False
-        self.beenden_ereignis.set()
-
-        if self.tls_socket:
-            try:
-                self.tls_socket.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            self.tls_socket.close()
-
-        if self.socket:
-            try:
-                self.socket.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            self.socket.close()
-
-
-# ============================================================
-# Hauptprogramm
-# ============================================================
+	"""Hauptklasse für den FlüsterNetz P2P-Chat."""
+
+	def __init__(self, benutzername="Anonym"):
+		self.benutzername = benutzername
+		self.verbunden = False
+		self.socket = None
+		self.tls_socket = None
+		self.sequenz_zaehler = 0
+		self.hmac_schluessel = None	# wird beim Handshake gesetzt
+		self.empfangs_thread = None
+		self.partner_name = ""
+		self.beenden_event = threading.Event()
+
+	def _naechste_sequenz(self):
+		"""Sequenznummer hochzählen, 16 Bit mit Überlauf."""
+		self.sequenz_zaehler = (self.sequenz_zaehler + 1) % 65536
+		return self.sequenz_zaehler
+
+	# --- TLS ---
+
+	def _tls_kontext_erstellen(self, ist_server=False):
+		"""TLS-Kontext mit mindestens TLS 1.2 erstellen."""
+		if ist_server:
+			ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+		else:
+			ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+			# Selbstsigniert -> keine CA-Prüfung möglich.
+			# Wir zeigen stattdessen den Fingerprint an (TOFU, wie bei SSH)
+			ctx.check_hostname = False
+			ctx.verify_mode = ssl.CERT_NONE
+
+		ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+		return ctx
+
+	def _zertifikate_erstellen(self):
+		"""Selbstsigniertes TLS-Zertifikat generieren (RSA 2048)."""
+		# Imports hier lokal weil wir die nur auf der Server-Seite brauchen
+		from cryptography import x509
+		from cryptography.x509.oid import NameOID
+		from cryptography.hazmat.primitives import hashes, serialization
+		from cryptography.hazmat.primitives.asymmetric import rsa
+		import datetime
+
+		schluessel = rsa.generate_private_key(
+			public_exponent=65537,
+			key_size=2048,
+		)
+
+		# Zertifikatsname - DHBW damit man sieht woher es kommt
+		name = x509.Name([
+			x509.NameAttribute(NameOID.COMMON_NAME, "FlüsterNetz"),
+			x509.NameAttribute(NameOID.ORGANIZATION_NAME, "DHBW Programmentwurf"),
+		])
+
+		jetzt = datetime.datetime.now(datetime.timezone.utc)
+		zertifikat = (
+			x509.CertificateBuilder()
+			.subject_name(name)
+			.issuer_name(name)
+			.public_key(schluessel.public_key())
+			.serial_number(x509.random_serial_number())
+			.not_valid_before(jetzt)
+			.not_valid_after(jetzt + datetime.timedelta(days=1))	# reicht für eine Sitzung
+			.sign(schluessel, hashes.SHA256())
+		)
+
+		# temp-Dateien, werden später wieder gelöscht
+		key_pfad = "/tmp/fluesternetz_key.pem"
+		cert_pfad = "/tmp/fluesternetz_cert.pem"
+
+		with open(key_pfad, "wb") as f:
+			f.write(schluessel.private_bytes(
+				serialization.Encoding.PEM,
+				serialization.PrivateFormat.TraditionalOpenSSL,
+				serialization.NoEncryption()
+			))
+		with open(cert_pfad, "wb") as f:
+			f.write(zertifikat.public_bytes(serialization.Encoding.PEM))
+
+		return cert_pfad, key_pfad
+
+	def _fingerprint_anzeigen(self):
+		"""
+		SHA-256 Fingerprint des Peer-Zertifikats ausgeben.
+		Damit kann man prüfen ob man wirklich mit dem richtigen
+		Partner verbunden ist und kein MITM dazwischen sitzt.
+		Gleiche Idee wie bei SSH beim ersten Verbinden.
+		"""
+		cert_bin = self.tls_socket.getpeercert(binary_form=True)
+		if not cert_bin:
+			print("[TLS] Kein Zertifikat vom Partner erhalten")
+			return
+		fp = hashlib.sha256(cert_bin).hexdigest()
+		fp_fmt = ':'.join(fp[i:i+2] for i in range(0, len(fp), 2))
+		print(f"[TLS] Zertifikats-Fingerprint:")
+		print(f"      {fp_fmt}")
+		print("[TLS] Bitte mit dem Partner vergleichen!")
+
+	# --- Senden und Empfangen ---
+
+	def _senden(self, paket):
+		"""Paket mit 4-Byte Längen-Prefix senden (Framing)."""
+		sock = self.tls_socket or self.socket
+		if not sock:
+			return
+		try:
+			daten = paket.packen(self.hmac_schluessel)
+			# Länge vorweg damit der Empfänger weiß wie viel er lesen muss
+			sock.sendall(struct.pack('!I', len(daten)) + daten)
+		except (BrokenPipeError, ConnectionResetError, OSError) as e:
+			print(f"\n[FEHLER] Senden fehlgeschlagen: {e}")
+			self.verbunden = False
+
+	def _empfangen(self, sock):
+		"""Komplettes Paket lesen: erst Länge (4 Byte), dann Daten."""
+		try:
+			laenge_roh = self._recv_exact(sock, 4)
+			if not laenge_roh:
+				return None
+			paket_laenge = struct.unpack('!I', laenge_roh)[0]
+
+			# Plausibilitätsprüfung damit uns niemand riesige Pakete unterjubelt
+			max_erlaubt = MAX_NUTZLAST + FluesternetzPaket.GESAMT_HEADER
+			if paket_laenge > max_erlaubt:
+				print(f"[FEHLER] Paketgröße überschreitet Limit: {paket_laenge}")
+				return None
+
+			daten = self._recv_exact(sock, paket_laenge)
+			if not daten:
+				return None
+
+			return FluesternetzPaket.entpacken(daten, self.hmac_schluessel)
+		except (ConnectionResetError, OSError):
+			return None
+
+	def _recv_exact(self, sock, n):
+		"""Exakt n Bytes lesen. None bei Abbruch."""
+		buf = b''
+		while len(buf) < n:
+			try:
+				chunk = sock.recv(n - len(buf))
+				if not chunk:
+					return None
+				buf += chunk
+			except (ConnectionResetError, OSError):
+				return None
+		return buf
+
+	# --- Handshake (vgl. Sequenzdiagramm Phase 3) ---
+
+	def _handshake(self, ist_server, sock):
+		"""
+		Benutzernamen austauschen und HMAC-Schlüssel vereinbaren.
+		Der Schlüssel wird innerhalb des TLS-Tunnels übertragen.
+		"""
+		if ist_server:
+			paket = self._empfangen(sock)
+			if not paket or paket.typ != NachrichtenTyp.HALLO:
+				raise ConnectionError("Kein gültiges HALLO empfangen")
+
+			client_info = json.loads(paket.nutzlast.decode('utf-8'))
+			self.partner_name = client_info.get('benutzername', 'Unbekannt')
+			print(f"[INFO] Anfrage von: {self.partner_name}")
+
+			# 32 Byte = 256 Bit HMAC-Schlüssel
+			self.hmac_schluessel = secrets.token_bytes(32)
+
+			antwort_daten = json.dumps({
+				'benutzername': self.benutzername,
+				'hmac_schluessel': self.hmac_schluessel.hex(),
+				'status': 'akzeptiert'
+			}).encode('utf-8')
+
+			antwort = FluesternetzPaket(
+				typ=NachrichtenTyp.HALLO_ANTWORT,
+				nutzlast=antwort_daten,
+				sequenz=self._naechste_sequenz()
+			)
+			# noch ohne HMAC weil der Partner den Schlüssel erst mit dieser Nachricht bekommt
+			self._senden_raw(sock, antwort)
+
+		else:
+			hallo_daten = json.dumps({
+				'benutzername': self.benutzername,
+				'version': PROTOKOLL_VERSION,
+			}).encode('utf-8')
+
+			hallo = FluesternetzPaket(
+				typ=NachrichtenTyp.HALLO,
+				nutzlast=hallo_daten,
+				sequenz=self._naechste_sequenz()
+			)
+			self._senden_raw(sock, hallo)
+
+			paket = self._empfangen(sock)
+			if not paket or paket.typ != NachrichtenTyp.HALLO_ANTWORT:
+				raise ConnectionError("Keine gültige HALLO_ANTWORT")
+
+			server_info = json.loads(paket.nutzlast.decode('utf-8'))
+			self.partner_name = server_info.get('benutzername', 'Unbekannt')
+
+			if server_info.get('status') != 'akzeptiert':
+				raise ConnectionError("Verbindung vom Server abgelehnt")
+
+			self.hmac_schluessel = bytes.fromhex(server_info['hmac_schluessel'])
+
+		print(f"[INFO] Handshake abgeschlossen mit {self.partner_name}")
+		self.verbunden = True
+
+	def _senden_raw(self, sock, paket):
+		"""Paket direkt über einen bestimmten Socket schicken (für Handshake)."""
+		daten = paket.packen(self.hmac_schluessel)
+		sock.sendall(struct.pack('!I', len(daten)) + daten)
+
+	# --- Nachrichtenverarbeitung ---
+
+	def _empfangs_schleife(self):
+		"""Läuft im Hintergrund-Thread, verarbeitet eingehende Pakete."""
+		sock = self.tls_socket if self.tls_socket else self.socket
+
+		while self.verbunden and not self.beenden_event.is_set():
+			paket = self._empfangen(sock)
+			if paket is None:
+				if self.verbunden:
+					print(f"\n[INFO] Verbindung zu {self.partner_name} verloren.")
+					self.verbunden = False
+				break
+			self._paket_verarbeiten(paket)
+
+	def _paket_verarbeiten(self, paket):
+		"""Eingehendes Paket je nach Typ behandeln."""
+		if paket.typ == NachrichtenTyp.CHAT:
+			nachricht = paket.nutzlast.decode('utf-8')
+			zeit = time.strftime('%H:%M:%S', time.localtime(paket.zeitstempel))
+			print(f"\n[{zeit}] {self.partner_name}: {nachricht}")
+			print(f"Du ({self.benutzername}): ", end='', flush=True)
+
+			# ACK senden
+			ack = FluesternetzPaket(
+				typ=NachrichtenTyp.BESTAETIGUNG,
+				nutzlast=struct.pack('!H', paket.sequenz),
+				sequenz=self._naechste_sequenz()
+			)
+			self._senden(ack)
+
+		elif paket.typ == NachrichtenTyp.BESTAETIGUNG:
+			pass	# TODO: evtl. unbestätigte Nachrichten tracken
+
+		elif paket.typ == NachrichtenTyp.HERZSCHLAG:
+			self._senden(FluesternetzPaket(
+				typ=NachrichtenTyp.HERZSCHLAG,
+				sequenz=self._naechste_sequenz()
+			))
+
+		elif paket.typ == NachrichtenTyp.TSCHUESS:
+			print(f"\n[INFO] {self.partner_name} hat den Chat verlassen.")
+			self.verbunden = False
+
+		elif paket.typ == NachrichtenTyp.FEHLER:
+			try:
+				msg = paket.nutzlast.decode('utf-8')
+			except UnicodeDecodeError:
+				msg = "(nicht lesbar)"
+			print(f"\n[FEHLER vom Partner] {msg}")
+
+		else:
+			print(f"\n[WARNUNG] Unbekannter Typ: {NachrichtenTyp.name_von(paket.typ)}")
+
+	def nachricht_senden(self, text):
+		"""Chat-Nachricht an den Partner schicken."""
+		if not self.verbunden:
+			print("[FEHLER] Nicht verbunden.")
+			return
+
+		encoded = text.encode('utf-8')
+		if len(encoded) > MAX_NUTZLAST:
+			print(f"[FEHLER] Nachricht zu lang ({len(encoded)} Bytes)")
+			return
+
+		paket = FluesternetzPaket(
+			typ=NachrichtenTyp.CHAT,
+			nutzlast=encoded,
+			sequenz=self._naechste_sequenz(),
+			flags=0x01	# Bit 0 = über TLS verschlüsselt
+		)
+		self._senden(paket)
+
+	# --- Server-Modus ---
+
+	def als_server_starten(self, port=PROTOKOLL_PORT):
+		"""Im Server-Modus auf eingehende Verbindung warten."""
+		print(f"-- FlüsterNetz Server --")
+		print(f"Benutzer: {self.benutzername}")
+		print(f"Port:     {port}")
+		print()
+
+		cert_pfad, key_pfad = self._zertifikate_erstellen()
+		print("[INFO] TLS-Zertifikat erstellt")
+
+		srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+		srv.bind(('0.0.0.0', port))
+		srv.listen(1)	# P2P, nur eine Verbindung
+
+		print(f"[INFO] Warte auf Verbindung...")
+
+		try:
+			client_sock, addr = srv.accept()
+			print(f"[INFO] Verbindung von {addr[0]}:{addr[1]}")
+
+			tls_ctx = self._tls_kontext_erstellen(ist_server=True)
+			tls_ctx.load_cert_chain(cert_pfad, key_pfad)
+			self.tls_socket = tls_ctx.wrap_socket(client_sock, server_side=True)
+			self.socket = client_sock
+			print(f"[INFO] TLS hergestellt: {self.tls_socket.version()}")
+
+			self._handshake(ist_server=True, sock=self.tls_socket)
+			self._chat_schleife()
+
+		except KeyboardInterrupt:
+			print("\n[INFO] Server beendet.")
+		except Exception as e:
+			print(f"[FEHLER] {e}")
+		finally:
+			self._aufraeumen()
+			srv.close()
+			for p in (cert_pfad, key_pfad):
+				if os.path.exists(p):
+					os.remove(p)
+
+	# --- Client-Modus ---
+
+	def als_client_verbinden(self, ziel, port=PROTOKOLL_PORT):
+		"""Im Client-Modus mit einem Server verbinden."""
+		print(f"-- FlüsterNetz Client --")
+		print(f"Benutzer: {self.benutzername}")
+		print(f"Ziel:     {ziel}:{port}")
+		print()
+
+		try:
+			self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+			self.socket.connect((ziel, port))
+			print(f"[INFO] TCP-Verbindung hergestellt")
+
+			tls_ctx = self._tls_kontext_erstellen(ist_server=False)
+			self.tls_socket = tls_ctx.wrap_socket(self.socket, server_hostname=ziel)
+			print(f"[INFO] TLS hergestellt: {self.tls_socket.version()}")
+
+			# Fingerprint anzeigen damit man prüfen kann ob kein MITM dazwischen ist
+			self._fingerprint_anzeigen()
+
+			self._handshake(ist_server=False, sock=self.tls_socket)
+			self._chat_schleife()
+
+		except ConnectionRefusedError:
+			print(f"[FEHLER] Verbindung zu {ziel}:{port} abgelehnt")
+		except KeyboardInterrupt:
+			print("\n[INFO] Verbindung beendet.")
+		except Exception as e:
+			print(f"[FEHLER] {e}")
+		finally:
+			self._aufraeumen()
+
+	# --- Chat-Schleife ---
+
+	def _chat_schleife(self):
+		"""Empfangs-Thread starten und Benutzereingaben verarbeiten."""
+		print()
+		print(f"Chat mit {self.partner_name} gestartet. /quit zum Beenden, /info für Details.")
+		print()
+
+		self.empfangs_thread = threading.Thread(
+			target=self._empfangs_schleife,
+			daemon=True,
+			name="Empfang"
+		)
+		self.empfangs_thread.start()
+
+		try:
+			while self.verbunden:
+				eingabe = input(f"Du ({self.benutzername}): ")
+				cmd = eingabe.strip().lower()
+
+				if not cmd:
+					continue
+				if cmd == '/quit':
+					print("[INFO] Chat wird beendet...")
+					self._verbindung_beenden()
+					break
+				elif cmd == '/info':
+					self._info_anzeigen()
+				else:
+					self.nachricht_senden(eingabe)
+
+		except (KeyboardInterrupt, EOFError):
+			print("\n[INFO] Chat wird beendet...")
+			self._verbindung_beenden()
+
+	def _verbindung_beenden(self):
+		"""TSCHUESS senden und Verbindung trennen."""
+		if not self.verbunden:
+			return
+		tschuess = FluesternetzPaket(
+			typ=NachrichtenTyp.TSCHUESS,
+			nutzlast=f"{self.benutzername} hat den Chat verlassen.".encode('utf-8'),
+			sequenz=self._naechste_sequenz()
+		)
+		self._senden(tschuess)
+		self.verbunden = False
+
+	def _info_anzeigen(self):
+		"""Verbindungsdetails ausgeben."""
+		tls_ver = self.tls_socket.version() if self.tls_socket else "keine"
+		print(f"\n--- Verbindungsinfo ---")
+		print(f"Protokoll: FlüsterNetz v{PROTOKOLL_VERSION}")
+		print(f"Partner:   {self.partner_name}")
+		print(f"TLS:       {tls_ver}")
+		print(f"HMAC:      {'aktiv' if self.hmac_schluessel else 'nicht gesetzt'}")
+		print(f"Sequenz:   {self.sequenz_zaehler}")
+		print(f"-----------------------\n")
+
+	def _aufraeumen(self):
+		"""Sockets schließen und alles sauber beenden."""
+		self.verbunden = False
+		self.beenden_event.set()
+
+		for sock in (self.tls_socket, self.socket):
+			if sock:
+				try:
+					sock.shutdown(socket.SHUT_RDWR)
+				except OSError:
+					pass
+				sock.close()
+
+# endregion
+
+
+# region Hauptprogramm
 
 def hauptprogramm():
-    """
-    Einstiegspunkt des FlüsterNetz-Chatprogramms.
-    Verarbeitet Kommandozeilenargumente und startet den Chat.
-    """
-    # Argument-Parser konfigurieren
-    parser = argparse.ArgumentParser(
-        description='FlüsterNetz - Sicheres P2P-Chatprotokoll',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Beispiele:
-  Server starten:    python3 fluesternetz.py server -n Alice
-  Client verbinden:  python3 fluesternetz.py client -z 192.168.1.100 -n Bob
-  Anderer Port:      python3 fluesternetz.py server -n Alice -p 9778
-        """
-    )
+	"""Kommandozeilenargumente verarbeiten und Chat starten."""
+	parser = argparse.ArgumentParser(
+		description='FlüsterNetz - Sicheres P2P-Chatprotokoll',
+		formatter_class=argparse.RawDescriptionHelpFormatter,
+		epilog="""Beispiele:
+  Server:  python3 fluesternetz.py server -n Alice
+  Client:  python3 fluesternetz.py client -z 10.0.0.1 -n Bob"""
+	)
 
-    # Unterbefehle für Server/Client-Modus
-    unterbefehle = parser.add_subparsers(dest='modus', help='Betriebsmodus')
-    unterbefehle.required = True
+	sub = parser.add_subparsers(dest='modus', help='Betriebsmodus')
+	sub.required = True
 
-    # Server-Modus Argumente
-    server_parser = unterbefehle.add_parser('server', help='Als Server starten (auf Verbindung warten)')
-    server_parser.add_argument('-n', '--name', default='Anonym', help='Benutzername (Standard: Anonym)')
-    server_parser.add_argument('-p', '--port', type=int, default=PROTOKOLL_PORT,
-                               help=f'Port (Standard: {PROTOKOLL_PORT})')
+	# Server-Argumente
+	sp = sub.add_parser('server', help='Auf Verbindung warten')
+	sp.add_argument('-n', '--name', default='Anonym', help='Benutzername')
+	sp.add_argument('-p', '--port', type=int, default=PROTOKOLL_PORT, help='Port')
 
-    # Client-Modus Argumente
-    client_parser = unterbefehle.add_parser('client', help='Als Client verbinden')
-    client_parser.add_argument('-z', '--ziel', required=True, help='IP-Adresse des Servers')
-    client_parser.add_argument('-n', '--name', default='Anonym', help='Benutzername (Standard: Anonym)')
-    client_parser.add_argument('-p', '--port', type=int, default=PROTOKOLL_PORT,
-                               help=f'Port (Standard: {PROTOKOLL_PORT})')
+	# Client-Argumente
+	cp = sub.add_parser('client', help='Mit Server verbinden')
+	cp.add_argument('-z', '--ziel', required=True, help='Server-IP')
+	cp.add_argument('-n', '--name', default='Anonym', help='Benutzername')
+	cp.add_argument('-p', '--port', type=int, default=PROTOKOLL_PORT, help='Port')
 
-    # Argumente parsen
-    argumente = parser.parse_args()
+	args = parser.parse_args()
+	chat = FluesternetzChat(benutzername=args.name)
 
-    # Chat-Instanz erstellen und starten
-    chat = FluesternetzChat(benutzername=argumente.name)
-
-    if argumente.modus == 'server':
-        chat.als_server_starten(port=argumente.port)
-    elif argumente.modus == 'client':
-        chat.als_client_verbinden(
-            ziel_adresse=argumente.ziel,
-            port=argumente.port
-        )
+	if args.modus == 'server':
+		chat.als_server_starten(port=args.port)
+	else:
+		chat.als_client_verbinden(ziel=args.ziel, port=args.port)
 
 
-# Programm starten, wenn direkt ausgeführt
 if __name__ == '__main__':
-    hauptprogramm()
+	hauptprogramm()
+
+# endregion
